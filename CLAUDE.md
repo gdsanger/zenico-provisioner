@@ -76,6 +76,9 @@ zenico-provisioner/
 - **Idempotenz beim Claim.** Das `claim()`-Pattern verhindert Doppel-
   Provisionierung nach einem Agent-Neustart. Nicht durch einfaches
   Status-Update ohne Atomarität ersetzen.
+- **Kein eigenes Dockerfile in diesem Repo.** Das Image kommt fertig gebaut
+  aus dem Friday/Zenico.app-Repo und wird hier ausschließlich über die
+  `DOCKER_IMAGE`-Env-Var referenziert.
 
 ## Git Workflow
 

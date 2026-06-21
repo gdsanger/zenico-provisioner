@@ -1,0 +1,15 @@
+[Unit]
+Description=Zenico Provisioning Agent
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=zenico-agent
+EnvironmentFile=/srv/zenico/provisioning-agent/.env.agent
+ExecStart=/srv/zenico/provisioning-agent/venv/bin/python /srv/zenico/provisioning-agent/agent.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

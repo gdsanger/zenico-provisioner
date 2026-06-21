@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  web:
+    image: {{ image }}:{{ image_tag }}
+    command: ["web"]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - default
+      - {{ proxy_network }}
+
+  worker:
+    image: {{ image }}:{{ image_tag }}
+    command: ["worker"]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+
+  beat:
+    image: {{ image }}:{{ image_tag }}
+    command: ["beat"]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  db_data:
+
+networks:
+  {{ proxy_network }}:
+    external: true
