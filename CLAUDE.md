@@ -6,7 +6,7 @@ Kontext und Leitplanken für Claude Code in diesem Repository.
 
 Eigenständiger Provisioning-Agent für Zenico. Läuft als Daemon auf dem
 Docker-Host und stellt Kunden-Instanzen automatisch bereit, sobald sie in
-Zenico.admin als "pending" markiert wurden.
+Zenico.admin mit Status "provisioning" (ungeclaimt) angelegt wurden.
 
 **Wichtig: Dies ist NICHT Teil von Zenico.admin und NICHT Teil von
 Friday/Zenico.app.** Es ist ein eigenständiges drittes Projekt, das beide
@@ -19,8 +19,8 @@ siehe Begründung unten unter "Verwandte Projekte".
 ```
 Zenico.admin (Daten)              zenico-provisioner (dieses Repo)
 ─────────────────────             ──────────────────────────────────
-status=pending  ◄──── poll ────   GET /api/instances/pending/
-                                   POST .../claim/        (→ provisioning)
+status=provisioning ◄── poll ──   GET /api/instances/pending/
+(claimed_at NULL)                  POST .../claim/        (→ claimed_at gesetzt)
                                           │
                                           ├─ Verzeichnis anlegen
                                           ├─ docker-compose.yml rendern
@@ -28,7 +28,7 @@ status=pending  ◄──── poll ────   GET /api/instances/pending/
                                           ├─ docker compose pull && up -d
                                           └─ /healthz/ pollen
                                           │
-status=running   ◄──── report ────  POST .../complete/
+status=active    ◄──── report ────  POST .../complete/
 status=failed    ◄──── report ────  POST .../fail/
 ```
 
