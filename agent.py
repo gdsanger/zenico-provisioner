@@ -2,8 +2,9 @@
 """
 Zenico Provisioning Agent
 ==========================
-Pollt Zenico.admin nach Instanzen mit Status "pending" und stellt sie lokal
-via Docker Compose bereit. Läuft auf dem Docker-Host selbst (kein SSH).
+Pollt Zenico.admin nach ungeclaimten Instanzen mit Status "provisioning"
+(GET /api/instances/pending/) und stellt sie lokal via Docker Compose
+bereit. Läuft auf dem Docker-Host selbst (kein SSH).
 
 Eigenständiges Script — Zenico.admin liefert nur Daten, dieses Script macht
 die eigentliche Bereitstellung.
@@ -25,6 +26,7 @@ verwechseln mit der .env, die pro Kunden-Instanz generiert wird):
 import logging
 import os
 import secrets
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -70,12 +72,15 @@ def claim(instance_id):
     return resp.json()
 
 
-def report_success(instance_id, url):
-    session.post(
+def report_success(instance_id, deploy_info):
+    """Meldet erfolgreiches Deployment. Payload laut API-CONTRACT.md:
+    django_secret_key, db_name, db_user, server_host."""
+    resp = session.post(
         f"{ADMIN_API_URL}/api/instances/{instance_id}/complete/",
-        json={"url": url},
+        json=deploy_info,
         timeout=10,
     )
+    resp.raise_for_status()
 
 
 def report_failure(instance_id, message):
@@ -89,6 +94,11 @@ def report_failure(instance_id, message):
 # ---------- Provisioning ----------
 
 def render_templates(instance, target_dir):
+    """Rendert docker-compose.yml und .env für die Instanz.
+
+    Gibt die generierten Deployment-Werte zurück, die anschließend über
+    /complete/ an Zenico.admin gemeldet werden (API-CONTRACT.md, Abschnitt 2).
+    """
     env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
 
     compose_context = {
@@ -99,18 +109,36 @@ def render_templates(instance, target_dir):
     compose_tpl = env.get_template("docker-compose.yml.j2")
     (target_dir / "docker-compose.yml").write_text(compose_tpl.render(**compose_context))
 
+    secret_key = secrets.token_urlsafe(50)
+    db_name = f"zenico_{instance['slug']}"
+    db_user = f"zenico_{instance['slug']}"
+
     env_context = {
-        "secret_key": secrets.token_urlsafe(50),
-        "allowed_hosts": instance["subdomain"],
-        "db_name": f"zenico_{instance['slug']}",
-        "db_user": f"zenico_{instance['slug']}",
+        "secret_key": secret_key,
+        "allowed_hosts": instance["fqdn"],
+        "site_url": f"https://{instance['fqdn']}",
+        "db_name": db_name,
+        "db_user": db_user,
         "db_password": secrets.token_urlsafe(32),
-        "ki_addon_enabled": instance.get("ki_addon", False),
+        "ki_addon_enabled": instance.get("ai_addon_active", False),
+        # Phone-Home-Konfiguration (siehe API-CONTRACT.md, Abschnitt 1):
+        # damit meldet sich die Kundeninstanz bei Zenico.admin zurück.
+        "zenico_admin_url": ADMIN_API_URL,
+        "zenico_api_key": instance["api_key"],
+        "zenico_instance_id": instance["id"],
+        "zenico_customer_id": instance["customer_id"],
     }
     env_tpl = env.get_template("env.j2")
     env_path = target_dir / ".env"
     env_path.write_text(env_tpl.render(**env_context))
     env_path.chmod(0o600)
+
+    return {
+        "django_secret_key": secret_key,
+        "db_name": db_name,
+        "db_user": db_user,
+        "server_host": socket.gethostname(),
+    }
 
 
 def docker_compose_up(target_dir):
@@ -145,9 +173,9 @@ def provision(instance):
     target_dir = INSTANCES_DIR / slug
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Provisioniere Instanz %s (%s)", slug, instance["subdomain"])
+    log.info("Provisioniere Instanz %s (%s)", slug, instance["fqdn"])
 
-    render_templates(instance, target_dir)
+    deploy_info = render_templates(instance, target_dir)
     docker_compose_up(target_dir)
 
     if not wait_for_health(slug, HEALTH_TIMEOUT):
@@ -158,7 +186,7 @@ def provision(instance):
     # (Forward Hostname: "{slug}-web-1", Forward Port: 8000).
 
     log.info("Instanz %s erfolgreich provisioniert", slug)
-    return f"https://{instance['subdomain']}"
+    return deploy_info
 
 
 def main_loop():
@@ -177,8 +205,8 @@ def main_loop():
                 log.info("Instanz %s bereits von anderem Lauf geclaimt, skip", item["id"])
                 continue
             try:
-                url = provision(instance)
-                report_success(instance["id"], url)
+                deploy_info = provision(instance)
+                report_success(instance["id"], deploy_info)
             except Exception as exc:
                 log.exception("Provisioning fehlgeschlagen für %s", instance.get("slug"))
                 report_failure(instance["id"], str(exc))
