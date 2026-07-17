@@ -18,7 +18,9 @@ periodisch nach neuen Instanzen. Für jede neue Instanz:
    Redis- und drei App-Container (web/worker/beat) aus demselben
    Zenico-app-Image
 4. Wartet auf einen erfolgreichen Health-Check (`/healthz/`)
-5. Meldet Erfolg oder Fehler zurück an Zenico.admin
+5. Legt (falls NPM konfiguriert) den Reverse-Proxy-Host inkl.
+   Let's-Encrypt-Zertifikat in Nginx Proxy Manager an
+6. Meldet Erfolg oder Fehler zurück an Zenico.admin
 
 Kein SSH, kein Multi-Tenancy — jede Instanz ist ein eigener, isolierter
 Satz Container (Docker-per-Customer, aus DSGVO-Gründen).
@@ -39,6 +41,9 @@ Zenico.admin  ──poll──>  zenico-provisioner  ──docker compose──>
 - Python 3.12
 - Zugriff auf die Image-Registry des Zenico-app-Images
 - Ein API-Token von Zenico.admin für die Agent-Authentifizierung
+- **DNS:** Ein Wildcard-Record `*.zenico.app` (bzw. die genutzte Basis-Domain)
+  muss auf die öffentliche IP des Hosts zeigen. Ohne diesen Record schlägt die
+  Let's-Encrypt-HTTP-Challenge beim automatischen Anlegen des Proxy-Hosts fehl.
 
 ## Setup
 
@@ -77,6 +82,15 @@ Alle Einstellungen über `.env.agent` (siehe `.env.agent.example`):
 | `PROXY_NETWORK` | Name des externen Docker-Netzwerks für NPM |
 | `POLL_INTERVAL` | Sekunden zwischen zwei Polls (Default: 30) |
 | `HEALTH_TIMEOUT` | Sekunden bis ein Health-Check als gescheitert gilt |
+| `NPM_API_URL` | Basis-URL des Nginx Proxy Manager (optional) |
+| `NPM_API_EMAIL` | Login-E-Mail des NPM-API-Users (optional) |
+| `NPM_API_PASSWORD` | Passwort des NPM-API-Users (optional) |
+
+Sind `NPM_API_URL`, `NPM_API_EMAIL` und `NPM_API_PASSWORD` gesetzt, legt der
+Agent nach dem Health-Check automatisch einen Proxy-Host mit Let's-Encrypt-
+Zertifikat in NPM an (idempotent — ein Retry legt keinen zweiten Host an).
+Fehlt eine der drei Variablen, bleibt dieser Schritt manuell und der Agent
+gibt nur einen Log-Hinweis aus.
 
 ## Projektstruktur
 
@@ -95,8 +109,6 @@ zenico-provisioner/
 
 ## Was (noch) nicht gemacht wird
 
-- NPM-Proxy-Host + Let's-Encrypt-Zertifikat automatisch anlegen
-  (aktuell manueller Schritt in Nginx Proxy Manager)
 - Backups pro Kunden-DB (separater Cronjob)
 - Updates bestehender Instanzen ausrollen (bewusst manuell)
 

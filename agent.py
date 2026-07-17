@@ -21,6 +21,13 @@ verwechseln mit der .env, die pro Kunden-Instanz generiert wird):
     PROXY_NETWORK       Name des externen Docker-Netzwerks für NPM
     POLL_INTERVAL       Sekunden zwischen Polls (Default: 30)
     HEALTH_TIMEOUT       Sekunden bis Health-Check als fehlgeschlagen gilt
+
+    NPM_API_URL         Basis-URL des Nginx Proxy Manager (optional)
+    NPM_API_EMAIL       Login-E-Mail des NPM-API-Users (optional)
+    NPM_API_PASSWORD    Passwort des NPM-API-Users (optional)
+
+Sind die drei NPM_*-Variablen nicht gesetzt, bleibt das Anlegen des
+Proxy-Hosts ein manueller Schritt (nur Log-Hinweis) — wie bisher.
 """
 
 import logging
@@ -41,6 +48,12 @@ INSTANCES_DIR = Path(os.environ.get("INSTANCES_DIR", "/srv/zenico/instances"))
 PROXY_NETWORK = os.environ.get("PROXY_NETWORK", "npm_proxy")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "120"))
+
+# Nginx Proxy Manager — optional. Nur wenn alle drei gesetzt sind, legt der
+# Agent den Proxy-Host automatisch an; sonst bleibt der Schritt manuell.
+NPM_API_URL = os.environ.get("NPM_API_URL", "").rstrip("/")
+NPM_API_EMAIL = os.environ.get("NPM_API_EMAIL", "")
+NPM_API_PASSWORD = os.environ.get("NPM_API_PASSWORD", "")
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
@@ -88,6 +101,108 @@ def report_failure(instance_id, message):
         f"{ADMIN_API_URL}/api/instances/{instance_id}/fail/",
         json={"error_message": message},
         timeout=10,
+    )
+
+
+# ---------- Nginx Proxy Manager (NPM) ----------
+
+def npm_configured():
+    """True, wenn alle drei NPM-Zugangsdaten gesetzt sind."""
+    return bool(NPM_API_URL and NPM_API_EMAIL and NPM_API_PASSWORD)
+
+
+def npm_get_token():
+    """Holt ein kurzlebiges NPM-API-Token (POST /api/tokens)."""
+    resp = requests.post(
+        f"{NPM_API_URL}/api/tokens",
+        json={"identity": NPM_API_EMAIL, "secret": NPM_API_PASSWORD},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()["token"]
+
+
+def npm_find_proxy_host(token, fqdn):
+    """Sucht einen bestehenden Proxy-Host für diese Domain (Idempotenz).
+    Gibt das Host-Objekt zurück oder None. Wichtig für Retry nach 'failed' —
+    ein zweiter Lauf darf keinen doppelten Host anlegen."""
+    resp = requests.get(
+        f"{NPM_API_URL}/api/nginx/proxy-hosts",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    for host in resp.json():
+        if fqdn in host.get("domain_names", []):
+            return host
+    return None
+
+
+def npm_create_proxy_host(token, fqdn, forward_host):
+    """Legt einen Proxy-Host mit automatischem Let's-Encrypt-Zertifikat an.
+    WebSocket-Support ist aktiviert (HTMX/Live-Updates in Zenico.app)."""
+    payload = {
+        "domain_names": [fqdn],
+        "forward_scheme": "http",
+        "forward_host": forward_host,
+        "forward_port": 8000,
+        "access_list_id": 0,
+        "certificate_id": "new",  # NPM stellt via Let's Encrypt ein neues Zertifikat aus
+        "ssl_forced": True,
+        "http2_support": True,
+        "allow_websocket_upgrade": True,
+        "block_exploits": True,
+        "caching_enabled": False,
+        "hsts_enabled": False,
+        "hsts_subdomains": False,
+        "advanced_config": "",
+        "locations": [],
+        "meta": {
+            "letsencrypt_email": NPM_API_EMAIL,
+            "letsencrypt_agree": True,
+            "dns_challenge": False,
+        },
+    }
+    resp = requests.post(
+        f"{NPM_API_URL}/api/nginx/proxy-hosts",
+        headers={"Authorization": f"Bearer {token}"},
+        json=payload,
+        timeout=60,  # LE-Zertifikatsausstellung kann einige Sekunden dauern
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def ensure_proxy_host(instance):
+    """Stellt sicher, dass für die Instanz ein NPM-Proxy-Host mit LE-Zertifikat
+    existiert — idempotent (kein doppelter Host bei einem Retry).
+
+    Ist NPM nicht konfiguriert, bleibt der Schritt manuell (nur Log-Hinweis);
+    das Verhalten entspricht dem bisherigen Stand. Fehler beim NPM-Aufruf
+    werden bewusst NICHT geschluckt, sondern propagiert — so meldet der
+    bestehende Pfad in main_loop() die Instanz als 'failed' an Zenico.admin.
+    """
+    fqdn = instance["fqdn"]
+    forward_host = f"{instance['slug']}-web-1"
+
+    if not npm_configured():
+        log.warning(
+            "NPM nicht konfiguriert — Proxy-Host für %s bitte manuell anlegen "
+            "(Forward Hostname: %s, Forward Port: 8000)",
+            fqdn, forward_host,
+        )
+        return
+
+    token = npm_get_token()
+    if npm_find_proxy_host(token, fqdn):
+        log.info("NPM-Proxy-Host für %s existiert bereits, überspringe", fqdn)
+        return
+
+    log.info("Lege NPM-Proxy-Host für %s an (Forward: %s:8000)", fqdn, forward_host)
+    npm_create_proxy_host(token, fqdn, forward_host)
+    log.info(
+        "NPM-Proxy-Host für %s angelegt (Let's-Encrypt-Zertifikat wird ausgestellt)",
+        fqdn,
     )
 
 
@@ -181,9 +296,9 @@ def provision(instance):
     if not wait_for_health(slug, HEALTH_TIMEOUT):
         raise RuntimeError(f"Health-Check für {slug} nach {HEALTH_TIMEOUT}s nicht erfolgreich")
 
-    # TODO (separater Schritt/Issue): NPM-Proxy-Host + Let's-Encrypt-Zertifikat
-    # automatisch über die NPM-API anlegen. Bis dahin: manuell in NPM eintragen
-    # (Forward Hostname: "{slug}-web-1", Forward Port: 8000).
+    # Proxy-Host + Let's-Encrypt-Zertifikat in NPM anlegen (erst nach dem
+    # Health-Check, damit die Domain sofort auf einen laufenden Container zeigt).
+    ensure_proxy_host(instance)
 
     log.info("Instanz %s erfolgreich provisioniert", slug)
     return deploy_info
