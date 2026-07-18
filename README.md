@@ -45,6 +45,57 @@ Zenico.admin  ──poll──>  zenico-provisioner  ──docker compose──>
   muss auf die öffentliche IP des Hosts zeigen. Ohne diesen Record schlägt die
   Let's-Encrypt-HTTP-Challenge beim automatischen Anlegen des Proxy-Hosts fehl.
 
+## DNS-Setup (einmalig, kein Pro-Instanz-Eintrag)
+
+Statt für jede Kunden-Instanz einen eigenen DNS-Eintrag über eine
+Registrar-API anzulegen, nutzt Zenico ein einmaliges Wildcard-Setup bei
+[INWX](https://www.inwx.de/):
+
+```
+*.zenico.app.   A   <öffentliche IP von ig-srv-02, dem NPM-Host>
+```
+
+Jede Subdomain (`kunde-a.zenico.app`, `kunde-b.zenico.app`, …) löst damit
+automatisch auf den NPM-Host auf — unabhängig davon, auf welchem Docker-Host
+die jeweilige Instanz tatsächlich läuft. Neue Instanzen brauchen **keinen**
+weiteren DNS-Eintrag; NPM übernimmt das Routing pro Subdomain (siehe
+"Multi-Host-Betrieb" unten).
+
+Let's Encrypt stellt die Zertifikate pro Subdomain über die HTTP-01-Challenge
+aus (NPM-Default) — das funktioniert mit dem Wildcard-DNS-Eintrag problemlos,
+weil jede Subdomain ja auf den NPM-Host auflöst, auf dem die Challenge
+beantwortet wird. Eine DNS-01-Challenge (über die INWX-API) wäre nur nötig,
+wenn ein echtes Wildcard-**Zertifikat** ausgestellt werden soll — das ist hier
+nicht der Fall, jede Instanz bekommt ihr eigenes Einzel-Zertifikat.
+
+## Multi-Host-Betrieb
+
+Standardmäßig (`INSTANCE_FORWARD_HOST` leer) laufen NPM und alle
+Kunden-Instanzen auf demselben Host (ig-srv-02) im gemeinsamen Docker-Netz
+`npm_proxy`; NPM leitet dann per Container-Namen weiter (`{slug}-web-1:8000`).
+
+Sobald eine Instanz auf einem anderen Host als NPM laufen soll, trägt das
+gemeinsame Docker-Netz nicht mehr über die Hostgrenze hinweg. Für diesen Fall:
+
+1. Auf dem Zielhost `INSTANCE_FORWARD_HOST` in `.env.agent` auf die von NPM
+   aus erreichbare Adresse dieses Hosts setzen (IP oder DNS-Name).
+2. Der Agent veröffentlicht dann den `web`-Service der Instanz auf einem
+   Host-Port (`ports: - "<port>:8000"` statt des `npm_proxy`-Netzes) und legt
+   den NPM-Proxy-Host mit `forward_host = INSTANCE_FORWARD_HOST` und
+   `forward_port = <port>` an.
+3. Der Health-Check läuft unverändert per `docker exec` direkt im Container —
+   unabhängig vom gewählten Forwarding-Modus.
+
+**Port-Vergabe:** Der Agent vergibt Host-Ports fortlaufend ab `WEB_PORT_BASE`
+(Default `28000`), kollisionsfrei ermittelt durch Scan der vorhandenen
+`docker-compose.yml`-Dateien unter `INSTANCES_DIR` — bewusst ohne eigene
+Datenbank/State-Datei. Bei einem Retry nach `failed` wird ein bereits
+vergebener Port für dieselbe Instanz wiederverwendet statt neu vergeben.
+Läuft mehr als ein Host im Multi-Host-Modus, braucht jeder Host seinen
+eigenen, nicht überlappenden `WEB_PORT_BASE` (z. B. Host A ab `28000`,
+Host B ab `29000`) — die Port-Vergabe ist nur lokal pro Host kollisionsfrei,
+da sie ausschließlich lokale `INSTANCES_DIR`-Einträge scannt.
+
 ## Setup
 
 ```bash
@@ -82,6 +133,8 @@ Alle Einstellungen über `.env.agent` (siehe `.env.agent.example`):
 | `PROXY_NETWORK` | Name des externen Docker-Netzwerks für NPM |
 | `POLL_INTERVAL` | Sekunden zwischen zwei Polls (Default: 30) |
 | `HEALTH_TIMEOUT` | Sekunden bis ein Health-Check als gescheitert gilt |
+| `INSTANCE_FORWARD_HOST` | Von NPM aus erreichbare Adresse dieses Hosts (optional, für Multi-Host-Betrieb — siehe unten) |
+| `WEB_PORT_BASE` | Startwert für die Host-Port-Vergabe im Multi-Host-Modus (Default: 28000) |
 | `NPM_API_URL` | Basis-URL des Nginx Proxy Manager (optional) |
 | `NPM_API_EMAIL` | Login-E-Mail des NPM-API-Users (optional) |
 | `NPM_API_PASSWORD` | Passwort des NPM-API-Users (optional) |

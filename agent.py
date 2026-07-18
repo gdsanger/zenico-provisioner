@@ -22,6 +22,18 @@ verwechseln mit der .env, die pro Kunden-Instanz generiert wird):
     POLL_INTERVAL       Sekunden zwischen Polls (Default: 30)
     HEALTH_TIMEOUT       Sekunden bis Health-Check als fehlgeschlagen gilt
 
+    INSTANCE_FORWARD_HOST  Von NPM aus erreichbare Adresse dieses
+                           Docker-Hosts (IP oder DNS-Name), z.B. wenn NPM
+                           auf einem anderen Host läuft als die Instanz
+                           (optional, Default leer). Leer = bisheriges
+                           Same-Host-Verhalten über den Container-Namen im
+                           npm_proxy-Netz. Gesetzt = Instanz veröffentlicht
+                           ihren web-Port auf dem Host, NPM leitet an
+                           INSTANCE_FORWARD_HOST:<Port> weiter.
+    WEB_PORT_BASE          Startwert für die Host-Port-Vergabe im
+                           Multi-Host-Modus (Default: 28000). Nur relevant,
+                           wenn INSTANCE_FORWARD_HOST gesetzt ist.
+
     NPM_API_URL         Basis-URL des Nginx Proxy Manager (optional)
     NPM_API_EMAIL       Login-E-Mail des NPM-API-Users (optional)
     NPM_API_PASSWORD    Passwort des NPM-API-Users (optional)
@@ -32,6 +44,7 @@ Proxy-Hosts ein manueller Schritt (nur Log-Hinweis) — wie bisher.
 
 import logging
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -48,6 +61,14 @@ INSTANCES_DIR = Path(os.environ.get("INSTANCES_DIR", "/srv/zenico/instances"))
 PROXY_NETWORK = os.environ.get("PROXY_NETWORK", "npm_proxy")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "120"))
+
+# Multi-Host-Forwarding — optional. Leer = Same-Host-Betrieb wie bisher
+# (Forward über Container-Namen im npm_proxy-Netz). Gesetzt = die Instanz
+# veröffentlicht ihren web-Port auf dem Host, NPM leitet an
+# INSTANCE_FORWARD_HOST:<Port> weiter (nötig, sobald NPM und Instanz auf
+# unterschiedlichen Hosts laufen und das Docker-Netz nicht mehr trägt).
+INSTANCE_FORWARD_HOST = os.environ.get("INSTANCE_FORWARD_HOST", "").strip()
+WEB_PORT_BASE = int(os.environ.get("WEB_PORT_BASE", "28000"))
 
 # Nginx Proxy Manager — optional. Nur wenn alle drei gesetzt sind, legt der
 # Agent den Proxy-Host automatisch an; sonst bleibt der Schritt manuell.
@@ -138,14 +159,14 @@ def npm_find_proxy_host(token, fqdn):
     return None
 
 
-def npm_create_proxy_host(token, fqdn, forward_host):
+def npm_create_proxy_host(token, fqdn, forward_host, forward_port):
     """Legt einen Proxy-Host mit automatischem Let's-Encrypt-Zertifikat an.
     WebSocket-Support ist aktiviert (HTMX/Live-Updates in Zenico.app)."""
     payload = {
         "domain_names": [fqdn],
         "forward_scheme": "http",
         "forward_host": forward_host,
-        "forward_port": 8000,
+        "forward_port": forward_port,
         "access_list_id": 0,
         "certificate_id": "new",  # NPM stellt via Let's Encrypt ein neues Zertifikat aus
         "ssl_forced": True,
@@ -173,7 +194,7 @@ def npm_create_proxy_host(token, fqdn, forward_host):
     return resp.json()
 
 
-def ensure_proxy_host(instance):
+def ensure_proxy_host(instance, web_port):
     """Stellt sicher, dass für die Instanz ein NPM-Proxy-Host mit LE-Zertifikat
     existiert — idempotent (kein doppelter Host bei einem Retry).
 
@@ -181,15 +202,25 @@ def ensure_proxy_host(instance):
     das Verhalten entspricht dem bisherigen Stand. Fehler beim NPM-Aufruf
     werden bewusst NICHT geschluckt, sondern propagiert — so meldet der
     bestehende Pfad in main_loop() die Instanz als 'failed' an Zenico.admin.
+
+    Same-Host (INSTANCE_FORWARD_HOST leer): Forward über den Container-Namen
+    im npm_proxy-Netz, wie bisher. Multi-Host (gesetzt): Forward über die
+    Host-Adresse + veröffentlichten web-Port, da das Docker-Netz über
+    Hostgrenzen hinweg nicht trägt.
     """
     fqdn = instance["fqdn"]
-    forward_host = f"{instance['slug']}-web-1"
+    if INSTANCE_FORWARD_HOST:
+        forward_host = INSTANCE_FORWARD_HOST
+        forward_port = web_port
+    else:
+        forward_host = f"{instance['slug']}-web-1"
+        forward_port = 8000
 
     if not npm_configured():
         log.warning(
             "NPM nicht konfiguriert — Proxy-Host für %s bitte manuell anlegen "
-            "(Forward Hostname: %s, Forward Port: 8000)",
-            fqdn, forward_host,
+            "(Forward Hostname: %s, Forward Port: %s)",
+            fqdn, forward_host, forward_port,
         )
         return
 
@@ -198,8 +229,8 @@ def ensure_proxy_host(instance):
         log.info("NPM-Proxy-Host für %s existiert bereits, überspringe", fqdn)
         return
 
-    log.info("Lege NPM-Proxy-Host für %s an (Forward: %s:8000)", fqdn, forward_host)
-    npm_create_proxy_host(token, fqdn, forward_host)
+    log.info("Lege NPM-Proxy-Host für %s an (Forward: %s:%s)", fqdn, forward_host, forward_port)
+    npm_create_proxy_host(token, fqdn, forward_host, forward_port)
     log.info(
         "NPM-Proxy-Host für %s angelegt (Let's-Encrypt-Zertifikat wird ausgestellt)",
         fqdn,
@@ -208,18 +239,51 @@ def ensure_proxy_host(instance):
 
 # ---------- Provisioning ----------
 
-def render_templates(instance, target_dir):
+def allocate_web_port(target_dir):
+    """Vergibt einen kollisionsfreien Host-Port für den web-Service im
+    Multi-Host-Modus (INSTANCE_FORWARD_HOST gesetzt).
+
+    Vergabe: WEB_PORT_BASE + fortlaufend, kollisionsfrei ermittelt durch
+    Scan aller vorhandenen docker-compose.yml-Dateien unter INSTANCES_DIR —
+    bewusst ohne eigene Datenbank/State-Datei, passend zum Solo-Maintainer-
+    Setup. Existiert für diese Instanz (Retry nach 'failed') bereits ein
+    docker-compose.yml mit einem veröffentlichten Port, wird dieser wieder-
+    verwendet statt neu vergeben.
+    """
+    compose_path = target_dir / "docker-compose.yml"
+    if compose_path.exists():
+        match = re.search(r'"(\d+):8000"', compose_path.read_text())
+        if match:
+            return int(match.group(1))
+
+    used_ports = set()
+    for compose_file in INSTANCES_DIR.glob("*/docker-compose.yml"):
+        for match in re.finditer(r'"(\d+):8000"', compose_file.read_text()):
+            used_ports.add(int(match.group(1)))
+
+    port = WEB_PORT_BASE
+    while port in used_ports:
+        port += 1
+    return port
+
+
+def render_templates(instance, target_dir, web_port):
     """Rendert docker-compose.yml und .env für die Instanz.
 
     Gibt die generierten Deployment-Werte zurück, die anschließend über
     /complete/ an Zenico.admin gemeldet werden (API-CONTRACT.md, Abschnitt 2).
     """
-    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATE_DIR)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
 
     compose_context = {
         "image": DOCKER_IMAGE,
         "image_tag": instance.get("image_tag", "latest"),
         "proxy_network": PROXY_NETWORK,
+        "web_port": web_port,
     }
     compose_tpl = env.get_template("docker-compose.yml.j2")
     (target_dir / "docker-compose.yml").write_text(compose_tpl.render(**compose_context))
@@ -290,7 +354,8 @@ def provision(instance):
 
     log.info("Provisioniere Instanz %s (%s)", slug, instance["fqdn"])
 
-    deploy_info = render_templates(instance, target_dir)
+    web_port = allocate_web_port(target_dir) if INSTANCE_FORWARD_HOST else None
+    deploy_info = render_templates(instance, target_dir, web_port)
     docker_compose_up(target_dir)
 
     if not wait_for_health(slug, HEALTH_TIMEOUT):
@@ -298,7 +363,7 @@ def provision(instance):
 
     # Proxy-Host + Let's-Encrypt-Zertifikat in NPM anlegen (erst nach dem
     # Health-Check, damit die Domain sofort auf einen laufenden Container zeigt).
-    ensure_proxy_host(instance)
+    ensure_proxy_host(instance, web_port)
 
     log.info("Instanz %s erfolgreich provisioniert", slug)
     return deploy_info

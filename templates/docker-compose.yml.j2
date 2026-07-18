@@ -21,9 +21,14 @@ services:
     depends_on:
       - db
       - redis
+{% if web_port %}
+    ports:
+      - "{{ web_port }}:8000"
+{% else %}
     networks:
       - default
       - {{ proxy_network }}
+{% endif %}
 
   worker:
     image: {{ image }}:{{ image_tag }}
@@ -46,6 +51,8 @@ services:
 volumes:
   db_data:
 
+{% if not web_port %}
 networks:
   {{ proxy_network }}:
     external: true
+{% endif %}
