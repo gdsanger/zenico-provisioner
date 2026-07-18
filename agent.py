@@ -16,7 +16,9 @@ verwechseln mit der .env, die pro Kunden-Instanz generiert wird):
 
     ADMIN_API_URL       z.B. https://admin.zenico.app
     ADMIN_API_TOKEN     Bearer-Token für die Agent<->Admin Kommunikation
-    DOCKER_IMAGE        z.B. registry.angermeier.net/zenico-app
+    DOCKER_IMAGE        z.B. ghcr.io/gdsanger/zenico-app (privates Package —
+                        Docker-Host braucht vorher `docker login ghcr.io`,
+                        siehe README/CLAUDE.md)
     INSTANCES_DIR       Basisverzeichnis, z.B. /srv/zenico/instances
     PROXY_NETWORK       Name des externen Docker-Netzwerks für NPM
     POLL_INTERVAL       Sekunden zwischen Polls (Default: 30)
@@ -56,7 +58,7 @@ from jinja2 import Environment, FileSystemLoader
 
 ADMIN_API_URL = os.environ["ADMIN_API_URL"].rstrip("/")
 ADMIN_API_TOKEN = os.environ["ADMIN_API_TOKEN"]
-DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "registry.angermeier.net/zenico-app")
+DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "ghcr.io/gdsanger/zenico-app")
 INSTANCES_DIR = Path(os.environ.get("INSTANCES_DIR", "/srv/zenico/instances"))
 PROXY_NETWORK = os.environ.get("PROXY_NETWORK", "npm_proxy")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))

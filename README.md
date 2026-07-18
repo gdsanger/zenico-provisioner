@@ -39,7 +39,15 @@ Zenico.admin  ──poll──>  zenico-provisioner  ──docker compose──>
   ```
   (Nginx Proxy Manager muss demselben Netzwerk angehören)
 - Python 3.12
-- Zugriff auf die Image-Registry des Zenico-app-Images
+- Zugriff auf die Image-Registry des Zenico-app-Images: `ghcr.io/gdsanger/zenico-app`
+  ist ein **privates** GitHub-Container-Registry-Package. Der Docker-Host muss
+  sich einmalig anmelden, bevor `docker compose pull` funktioniert:
+  ```bash
+  docker login ghcr.io -u gdsanger
+  # Passwort: Personal Access Token mit Scope "read:packages" (nur lesend)
+  ```
+  Das Credential landet in `~/.docker/config.json` auf dem Host — **nicht**
+  in `.env.agent` und nicht im Repo.
 - Ein API-Token von Zenico.admin für die Agent-Authentifizierung
 - **DNS:** Ein Wildcard-Record `*.zenico.app` (bzw. die genutzte Basis-Domain)
   muss auf die öffentliche IP des Hosts zeigen. Ohne diesen Record schlägt die

@@ -102,8 +102,15 @@ zenico-provisioner/
 ## Verwandte Projekte (nicht in diesem Repo)
 
 - **Friday / Zenico.app** — liefert das Docker-Image, das hier konsumiert
-  wird (`DOCKER_IMAGE` Env-Var). Health-Check-Endpoint `/healthz/` ist dort
-  bereits implementiert.
+  wird (`DOCKER_IMAGE` Env-Var, Default `ghcr.io/gdsanger/zenico-app`).
+  Health-Check-Endpoint `/healthz/` ist dort bereits implementiert.
+  Das ghcr-Package ist **privat** — Voraussetzung auf jedem Docker-Host,
+  auf dem der Agent läuft, ist ein einmaliges
+  `docker login ghcr.io -u gdsanger` mit einem read-only PAT
+  (Scope `read:packages`). Ohne diesen Login schlägt `docker compose pull`
+  fehl. Das Credential liegt danach in `~/.docker/config.json` auf dem
+  Host — nicht in `.env.agent`, nicht im Repo (siehe README.md
+  "Voraussetzungen").
 - **Zenico.admin** — liefert die Instanz-Daten über die API
   (`/api/instances/pending/`, `/claim/`, `/complete/`, `/fail/`). Diese
   Endpoints müssen ggf. noch dort ergänzt werden — das ist ein Issue im
