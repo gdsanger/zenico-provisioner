@@ -44,6 +44,7 @@ Sind die drei NPM_*-Variablen nicht gesetzt, bleibt das Anlegen des
 Proxy-Hosts ein manueller Schritt (nur Log-Hinweis) — wie bisher.
 """
 
+import base64
 import logging
 import os
 import re
@@ -241,6 +242,15 @@ def ensure_proxy_host(instance, web_port):
 
 # ---------- Provisioning ----------
 
+def _existing_env_value(env_path, key):
+    """Liest einen einzelnen Wert aus einer bereits vorhandenen .env-Datei,
+    ohne die Datei zu parsen/anzufassen (siehe render_templates)."""
+    if not env_path.exists():
+        return None
+    match = re.search(rf"^{re.escape(key)}=(.*)$", env_path.read_text(), re.MULTILINE)
+    return match.group(1) if match else None
+
+
 def allocate_web_port(target_dir):
     """Vergibt einen kollisionsfreien Host-Port für den web-Service im
     Multi-Host-Modus (INSTANCE_FORWARD_HOST gesetzt).
@@ -290,29 +300,43 @@ def render_templates(instance, target_dir, web_port):
     compose_tpl = env.get_template("docker-compose.yml.j2")
     (target_dir / "docker-compose.yml").write_text(compose_tpl.render(**compose_context))
 
-    secret_key = secrets.token_urlsafe(50)
     db_name = f"zenico_{instance['slug']}"
     db_user = f"zenico_{instance['slug']}"
-
-    env_context = {
-        "secret_key": secret_key,
-        "allowed_hosts": instance["fqdn"],
-        "site_url": f"https://{instance['fqdn']}",
-        "db_name": db_name,
-        "db_user": db_user,
-        "db_password": secrets.token_urlsafe(32),
-        "ki_addon_enabled": instance.get("ai_addon_active", False),
-        # Phone-Home-Konfiguration (siehe API-CONTRACT.md, Abschnitt 1):
-        # damit meldet sich die Kundeninstanz bei Zenico.admin zurück.
-        "zenico_admin_url": ADMIN_API_URL,
-        "zenico_api_key": instance["api_key"],
-        "zenico_instance_id": instance["id"],
-        "zenico_customer_id": instance["customer_id"],
-    }
-    env_tpl = env.get_template("env.j2")
     env_path = target_dir / ".env"
-    env_path.write_text(env_tpl.render(**env_context))
-    env_path.chmod(0o600)
+
+    if env_path.exists():
+        # Re-Provisioning (z.B. Retry nach 'failed'): SECRET_KEY,
+        # FIELD_ENCRYPTION_KEY und DB_PASSWORD NICHT neu generieren. Sonst
+        # sind bereits verschlüsselte DB-Felder (MailConfig/AzureSSOConfig)
+        # nicht mehr entschlüsselbar, und der Postgres-Container (persistentes
+        # Volume) verweigert mit einem neuen Passwort die Anmeldung.
+        log.info("Vorhandene .env für %s gefunden, Secrets bleiben unverändert", instance["slug"])
+        secret_key = _existing_env_value(env_path, "SECRET_KEY")
+    else:
+        secret_key = secrets.token_urlsafe(50)
+        # Fernet-Key: exakt 32 Bytes, url-safe base64 MIT Padding.
+        # secrets.token_urlsafe() erzeugt KEIN gültiges Fernet-Format (kein Padding).
+        field_encryption_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+
+        env_context = {
+            "secret_key": secret_key,
+            "field_encryption_key": field_encryption_key,
+            "allowed_hosts": instance["fqdn"],
+            "site_url": f"https://{instance['fqdn']}",
+            "db_name": db_name,
+            "db_user": db_user,
+            "db_password": secrets.token_urlsafe(32),
+            "ki_addon_enabled": instance.get("ai_addon_active", False),
+            # Phone-Home-Konfiguration (siehe API-CONTRACT.md, Abschnitt 1):
+            # damit meldet sich die Kundeninstanz bei Zenico.admin zurück.
+            "zenico_admin_url": ADMIN_API_URL,
+            "zenico_api_key": instance["api_key"],
+            "zenico_instance_id": instance["id"],
+            "zenico_customer_id": instance["customer_id"],
+        }
+        env_tpl = env.get_template("env.j2")
+        env_path.write_text(env_tpl.render(**env_context))
+        env_path.chmod(0o600)
 
     return {
         "django_secret_key": secret_key,

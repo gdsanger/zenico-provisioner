@@ -153,6 +153,24 @@ Zertifikat in NPM an (idempotent — ein Retry legt keinen zweiten Host an).
 Fehlt eine der drei Variablen, bleibt dieser Schritt manuell und der Agent
 gibt nur einen Log-Hinweis aus.
 
+## Generierte Secrets pro Instanz
+
+Beim Erst-Deployment generiert der Agent in der Kunden-`.env`:
+
+| Variable | Zweck |
+|---|---|
+| `SECRET_KEY` | Django-Session-/Signing-Key |
+| `FIELD_ENCRYPTION_KEY` | Fernet-Key für `encrypted_model_fields` (verschlüsselte DB-Felder, z. B. MailConfig/AzureSSOConfig-Secrets). Muss ein gültiger Fernet-Key sein (32 url-safe base64-kodierte Bytes **mit** Padding) — `secrets.token_urlsafe()` reicht dafür nicht aus. Ohne diesen Wert startet Django gar nicht (`ImproperlyConfigured`). |
+| `DB_PASSWORD` | Passwort des Instanz-eigenen Postgres-Users |
+
+**Re-Provisioning (Retry nach `failed`):** Existiert für die Instanz bereits
+eine `.env`, generiert der Agent diese Secrets **nicht** neu, sondern lässt
+die Datei unverändert. Ein neuer `FIELD_ENCRYPTION_KEY` würde bereits
+verschlüsselte DB-Felder unlesbar machen, ein neues `DB_PASSWORD` passt nicht
+mehr zum Passwort, mit dem Postgres im persistenten Volume initialisiert
+wurde. Nur beim allerersten Lauf (kein `.env` vorhanden) werden neue Secrets
+erzeugt.
+
 ## Projektstruktur
 
 ```
