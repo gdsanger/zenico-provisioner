@@ -22,6 +22,9 @@ periodisch nach neuen Instanzen. Für jede neue Instanz:
    Let's-Encrypt-Zertifikat in Nginx Proxy Manager an
 6. Meldet Erfolg oder Fehler zurück an Zenico.admin
 
+Zusätzlich pollt derselbe Agent nach Instanzen, die zum Abbau freigegeben
+wurden, und baut diese vollständig ab (siehe "De-Provisioning" unten).
+
 Kein SSH, kein Multi-Tenancy — jede Instanz ist ein eigener, isolierter
 Satz Container (Docker-per-Customer, aus DSGVO-Gründen).
 
@@ -152,6 +155,42 @@ Agent nach dem Health-Check automatisch einen Proxy-Host mit Let's-Encrypt-
 Zertifikat in NPM an (idempotent — ein Retry legt keinen zweiten Host an).
 Fehlt eine der drei Variablen, bleibt dieser Schritt manuell und der Agent
 gibt nur einen Log-Hinweis aus.
+
+## De-Provisioning
+
+Neben `pending` pollt der Agent im selben Loop `GET
+/api/instances/to-deprovision/` — Instanzen, die Zenico.admin zum
+vollständigen Abbau freigegeben hat. **Ob** eine Instanz dort landet
+(sofortiger Abbau nach Trial-Ende ohne Zahlung, oder erst nach 30 Tagen
+Read-Only-Grace-Period nach einer Kündigung) entscheidet ausschließlich
+Zenico.admin — dieser Agent kennt den Unterschied nicht und fährt in
+beiden Fällen denselben Hard-Delete:
+
+1. Claimt die Instanz (`POST .../claim-deprovision/`, 409 bei
+   Doppel-Claim — analog zum Provisioning-Claim)
+2. `docker compose down -v` — Container **und** Volumes (Postgres-/
+   Redis-Daten) werden entfernt
+3. Entfernt (falls NPM konfiguriert) den Proxy-Host inkl.
+   Let's-Encrypt-Zertifikat in Nginx Proxy Manager
+4. Löscht das Instanz-Verzeichnis unter `INSTANCES_DIR`
+5. Meldet Erfolg (`POST .../deprovisioned/`) oder Fehler
+   (`POST .../deprovision-failed/`) zurück an Zenico.admin
+
+Jeder Teilschritt prüft vorher, ob es dort überhaupt noch etwas zu tun
+gibt (Verzeichnis/Compose-Datei vorhanden? NPM-Host vorhanden?) — ein
+Retry nach `deprovision-failed` wirft dadurch keinen Fehler auf bereits
+erledigten Teilschritten.
+
+**Datenverlust ist hier beabsichtigt und endgültig** (DSGVO-Löschung,
+siehe CLAUDE.md). Der Read-Only-Zustand vor dem Abbau (`suspended`,
+inkl. 30-Tage-Grace-Period und Reaktivierungsmöglichkeit) wird
+vollständig in Zenico.admin verwaltet — sobald eine Instanz hier über
+`to-deprovision` auftaucht, ist die Frist bereits final abgelaufen.
+
+> Die Endpoints `to-deprovision/`, `claim-deprovision/`,
+> `deprovisioned/` und `deprovision-failed/` müssen in Zenico.admin
+> noch ergänzt werden (analog zu `pending/`/`claim/`/`complete/`/`fail/`)
+> — das ist ein Issue im Zenico.admin-Repo, nicht hier.
 
 ## Generierte Secrets pro Instanz
 
