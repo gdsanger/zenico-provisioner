@@ -6,6 +6,14 @@ Pollt Zenico.admin nach ungeclaimten Instanzen mit Status "provisioning"
 (GET /api/instances/pending/) und stellt sie lokal via Docker Compose
 bereit. Läuft auf dem Docker-Host selbst (kein SSH).
 
+Zusätzlich pollt der Agent Instanzen mit Status "deprovisioning"
+(GET /api/instances/to-deprovision/) und baut sie vollständig ab (Hard-
+Delete: Container + Volumes + Verzeichnis + NPM-Proxy-Host). Ob eine
+Instanz dort landet — sofort nach Trial-Ende oder erst nach 30 Tagen
+Grace-Period nach einer Kündigung — entscheidet ausschließlich
+Zenico.admin; der Agent kennt diesen Unterschied nicht und baut in beiden
+Fällen gleich ab.
+
 Eigenständiges Script — Zenico.admin liefert nur Daten, dieses Script macht
 die eigentliche Bereitstellung.
 
@@ -49,6 +57,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import time
@@ -123,6 +132,40 @@ def report_success(instance_id, deploy_info):
 def report_failure(instance_id, message):
     session.post(
         f"{ADMIN_API_URL}/api/instances/{instance_id}/fail/",
+        json={"error_message": message},
+        timeout=10,
+    )
+
+
+def fetch_to_deprovision():
+    """Analog zu fetch_pending(): Instanzen, die Zenico.admin zum Abbau
+    freigegeben hat (Status 'deprovisioning') — egal ob Pfad A (Trial ohne
+    Zahlung) oder Pfad B (Kündigung nach 30 Tagen Grace-Period), siehe
+    CLAUDE.md."""
+    resp = session.get(f"{ADMIN_API_URL}/api/instances/to-deprovision/", timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def claim_deprovision(instance_id):
+    """Markiert die Instanz atomar als 'in Abbau' und gibt die vollen Daten
+    zurück. 409 = bereits von einem anderen Lauf geclaimt (Idempotenz,
+    analog zu claim())."""
+    resp = session.post(f"{ADMIN_API_URL}/api/instances/{instance_id}/claim-deprovision/", timeout=10)
+    if resp.status_code == 409:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def report_deprovisioned(instance_id):
+    resp = session.post(f"{ADMIN_API_URL}/api/instances/{instance_id}/deprovisioned/", timeout=10)
+    resp.raise_for_status()
+
+
+def report_deprovision_failed(instance_id, message):
+    session.post(
+        f"{ADMIN_API_URL}/api/instances/{instance_id}/deprovision-failed/",
         json={"error_message": message},
         timeout=10,
     )
@@ -238,6 +281,41 @@ def ensure_proxy_host(instance, web_port):
         "NPM-Proxy-Host für %s angelegt (Let's-Encrypt-Zertifikat wird ausgestellt)",
         fqdn,
     )
+
+
+def npm_delete_proxy_host(token, host_id):
+    """Entfernt einen Proxy-Host (samt Let's-Encrypt-Zertifikat) über die
+    NPM-API."""
+    resp = requests.delete(
+        f"{NPM_API_URL}/api/nginx/proxy-hosts/{host_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def remove_proxy_host(fqdn):
+    """Entfernt den NPM-Proxy-Host für die Domain — idempotent: existiert
+    keiner (mehr), z.B. bei einem Retry nach 'deprovision-failed', wird der
+    Schritt übersprungen statt einen Fehler zu werfen.
+
+    Ist NPM nicht konfiguriert, bleibt das Entfernen manuell (nur
+    Log-Hinweis), analog zu ensure_proxy_host().
+    """
+    if not npm_configured():
+        log.warning(
+            "NPM nicht konfiguriert — Proxy-Host für %s bitte manuell entfernen", fqdn,
+        )
+        return
+
+    token = npm_get_token()
+    host = npm_find_proxy_host(token, fqdn)
+    if host is None:
+        log.info("Kein NPM-Proxy-Host für %s (mehr) vorhanden, überspringe", fqdn)
+        return
+
+    log.info("Entferne NPM-Proxy-Host für %s", fqdn)
+    npm_delete_proxy_host(token, host["id"])
 
 
 # ---------- Provisioning ----------
@@ -395,6 +473,44 @@ def provision(instance):
     return deploy_info
 
 
+# ---------- De-Provisioning ----------
+
+def docker_compose_down(target_dir):
+    """Fährt die Instanz-Container herunter und entfernt dabei die Volumes
+    (Postgres-/Redis-Daten) — Hard-Delete gemäß CLAUDE.md (DSGVO-Löschung,
+    keine Aufbewahrungsfrist auf Docker-Ebene, die läuft ausschließlich als
+    Read-Only-Grace-Period vorher in Zenico.admin)."""
+    subprocess.run(
+        ["docker", "compose", "down", "-v"],
+        cwd=target_dir, check=True, capture_output=True, text=True,
+    )
+
+
+def deprovision(instance):
+    """Baut eine Instanz vollständig ab: Container + Volumes, NPM-Proxy-Host,
+    Verzeichnis. Idempotent — jeder Teilschritt prüft erst, ob es überhaupt
+    noch etwas zu entfernen gibt, damit ein Retry nach 'deprovision-failed'
+    (z.B. Abbruch mitten im Teardown) keinen Fehler wirft."""
+    slug = instance["slug"]
+    target_dir = INSTANCES_DIR / slug
+
+    log.info("De-provisioniere Instanz %s (%s)", slug, instance.get("fqdn"))
+
+    if (target_dir / "docker-compose.yml").exists():
+        docker_compose_down(target_dir)
+    else:
+        log.info("Kein docker-compose.yml für %s gefunden, überspringe Container-Teardown", slug)
+
+    fqdn = instance.get("fqdn")
+    if fqdn:
+        remove_proxy_host(fqdn)
+
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+
+    log.info("Instanz %s vollständig abgebaut", slug)
+
+
 def main_loop():
     log.info("Provisioning-Agent gestartet. Poll-Intervall: %ss", POLL_INTERVAL)
     while True:
@@ -416,6 +532,25 @@ def main_loop():
             except Exception as exc:
                 log.exception("Provisioning fehlgeschlagen für %s", instance.get("slug"))
                 report_failure(instance["id"], str(exc))
+
+        try:
+            to_deprovision = fetch_to_deprovision()
+        except requests.RequestException as exc:
+            log.error("Admin-API (to-deprovision) nicht erreichbar: %s", exc)
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        for item in to_deprovision:
+            instance = claim_deprovision(item["id"])
+            if instance is None:
+                log.info("Instanz %s bereits von anderem Lauf zum Abbau geclaimt, skip", item["id"])
+                continue
+            try:
+                deprovision(instance)
+                report_deprovisioned(instance["id"])
+            except Exception as exc:
+                log.exception("De-Provisioning fehlgeschlagen für %s", instance.get("slug"))
+                report_deprovision_failed(instance["id"], str(exc))
 
         time.sleep(POLL_INTERVAL)
 
